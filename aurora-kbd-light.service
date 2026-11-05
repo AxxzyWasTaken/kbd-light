@@ -1,0 +1,24 @@
+[Unit]
+Description=Keyboard backlight that follows the ambient light sensor
+Documentation=https://github.com/aurora-silicon/kbd-light
+After=systemd-backlight@leds:kbd_backlight.service
+ConditionPathExistsGlob=/sys/class/leds/*kbd_backlight
+
+[Service]
+ExecStart=/usr/bin/aurora-kbd-light
+EnvironmentFile=-/etc/default/aurora-kbd-light
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

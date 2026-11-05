@@ -7,7 +7,8 @@
  * gets brighter, off in daylight. A change made by anyone else (the desktop's
  * slider, idle dimming) is respected: setting it to zero keeps it off until it
  * is turned on again, and any other level holds until the room's light
- * changes a lot. With the lid closed the backlight is off.
+ * changes a lot. With the lid closed or the displays asleep the backlight
+ * is off.
  *
  * Only sysfs and evdev are used, so this needs nothing beyond libc.
  */
@@ -32,6 +33,7 @@
 #define SMOOTH_S 2.0		/* time constant of the lux average */
 #define DEADBAND 3		/* ignore smaller level changes */
 #define HOLD_RATIO 4.0		/* light change that ends a manual hold */
+#define DISPLAYS_OFF_S 1.0	/* displays dark this long: backlight off */
 
 struct config {
 	double full_lux;	/* at or below: the brightest automatic level */
@@ -179,6 +181,33 @@ static bool lid_closed(int fd)
 	return (bits[SW_LID / (8 * sizeof(long))] >> (SW_LID % (8 * sizeof(long)))) & 1;
 }
 
+/*
+ * True when every connected display is powered off, as when the desktop
+ * blanks the screens. Atomic drivers keep the connector's dpms attribute in
+ * step with its CRTC.
+ */
+static bool displays_off(void)
+{
+	int connected = 0, on = 0;
+	glob_t g;
+
+	if (glob("/sys/class/drm/card*-*/status", 0, NULL, &g) != 0)
+		return false;
+	for (size_t i = 0; i < g.gl_pathc; i++) {
+		char buf[32], dpms[512];
+		size_t len = strlen(g.gl_pathv[i]) - strlen("status");
+
+		if (read_file(g.gl_pathv[i], buf, sizeof(buf)) || strncmp(buf, "connected", 9))
+			continue;
+		connected++;
+		snprintf(dpms, sizeof(dpms), "%.*sdpms", (int)len, g.gl_pathv[i]);
+		if (read_file(dpms, buf, sizeof(buf)) || !strncmp(buf, "On", 2))
+			on++;
+	}
+	globfree(&g);
+	return connected && !on;
+}
+
 static double now_s(void)
 {
 	struct timespec ts;
@@ -221,9 +250,9 @@ int main(int argc, char **argv)
 	};
 	char *led_dir, *als_path, bright_path[512], max_path[512];
 	double log_lux = NAN, last_t, hold_log_lux = 0;
-	long max, cur, written = -1, auto_last = -1, target;
+	long max, cur, written = -1, auto_last = -1, hold_level = 0, target;
 	bool hold = false, off_latch = false, write_failed = false;
-	double lid_retry_t;
+	double lid_retry_t, dark_since = -1;
 	int lid_fd;
 
 	for (int i = 1; i < argc; i++)
@@ -261,7 +290,7 @@ int main(int argc, char **argv)
 
 	while (!stop) {
 		double lux, t = now_s(), dt = t - last_t;
-		bool fading;
+		bool fading, dark, automatic;
 
 		last_t = t;
 		/* The lid switch can register after this starts. */
@@ -284,6 +313,7 @@ int main(int argc, char **argv)
 			} else {
 				off_latch = false;
 				hold = true;
+				hold_level = cur;
 				hold_log_lux = log_lux;
 			}
 			if (c.verbose)
@@ -304,12 +334,27 @@ int main(int argc, char **argv)
 
 		if (written < 0)
 			written = cur;	/* first pass: start from what is set */
-		if (off_latch || hold || isnan(log_lux)) {
+
+		if (!displays_off())
+			dark_since = -1;
+		else if (dark_since < 0)
+			dark_since = t;
+		dark = lid_closed(lid_fd) ||
+		       (dark_since >= 0 && t - dark_since >= DISPLAYS_OFF_S);
+
+		/* A closed lid or sleeping displays win; a held level comes back after. */
+		automatic = false;
+		if (dark || off_latch) {
+			target = 0;
+		} else if (hold) {
+			target = hold_level;
+		} else if (!isnan(log_lux)) {
+			target = auto_level(&c, log_lux, written > 0, max);
+			automatic = true;
+		} else {
 			sleep_ms(TICK_MS);
 			continue;
 		}
-
-		target = lid_closed(lid_fd) ? 0 : auto_level(&c, log_lux, written > 0, max);
 		if (labs(target - written) < DEADBAND && target != 0 && written != 0)
 			target = written;
 		fading = target != written;
@@ -324,7 +369,7 @@ int main(int argc, char **argv)
 				next = target;
 			if (write_int(bright_path, next) == 0) {
 				written = next;
-				if (written == target)
+				if (written == target && automatic)
 					auto_last = target;
 				write_failed = false;
 			} else {
@@ -334,9 +379,14 @@ int main(int argc, char **argv)
 				write_failed = true;
 				fading = false;	/* retry at the normal pace */
 			}
-			if (c.verbose && written == target)
-				fprintf(stderr, "lux %.2f -> level %ld\n", pow(10, log_lux), target);
-		} else {
+			if (c.verbose && written == target) {
+				if (automatic)
+					fprintf(stderr, "lux %.2f -> level %ld\n", pow(10, log_lux), target);
+				else
+					fprintf(stderr, "%s -> level %ld\n", dark ?
+						"lid closed or displays asleep" : "held level", target);
+			}
+		} else if (automatic) {
 			auto_last = written;
 		}
 		sleep_ms(fading ? FADE_TICK_MS : TICK_MS);
